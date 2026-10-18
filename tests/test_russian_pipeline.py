@@ -179,6 +179,43 @@ class RussianPipelineTests(unittest.TestCase):
         self.assertIn("Анна", content)
 
 
+        self.assertIn("Анна", content)
+
+
+class JunkNameFilterTests(unittest.TestCase):
+    """Sentence-initial function words must never become characters.
+
+    ``ru_core_news_sm`` capitalizes every sentence-initial word and sometimes
+    tags such words as PROPN/PER, which used to turn «кто», «то», «ну» and
+    friends into bogus characters.
+    """
+
+    JUNK = (
+        "кто", "то", "ну", "на", "после", "от", "мой", "иной", "никто",
+        "возможно", "итак", "спасибо", "верно", "правда", "сколько",
+        "зато", "тебе", "слишком", "кого", "шестьдесят", "десятая",
+        "первого", "вперёд", "по", "не",
+    )
+    REAL = ("локен", "хорус", "каркази", "зиндерманн", "иван", "анна", "петров")
+
+    def test_function_words_are_not_plausible_names(self):
+        for word in self.JUNK:
+            self.assertFalse(RussianBookNLP._plausible_name((word,)), word)
+
+    def test_real_names_are_plausible(self):
+        for word in self.REAL:
+            self.assertTrue(RussianBookNLP._plausible_name((word,)), word)
+
+    def test_sentence_start_fallback_uses_previous_punctuation(self):
+        text = "Он вошёл. Локен ждал."
+        self.assertTrue(
+            RussianBookNLP._starts_sentence(text, None, text.index("Локен"))
+        )
+        self.assertFalse(
+            RussianBookNLP._starts_sentence(text, None, text.index("ждал"))
+        )
+
+
 class CyrillicNormalizationTests(unittest.TestCase):
     def test_normalize_name_keeps_cyrillic(self):
         self.assertEqual(_normalize_name("Иван Петров"), "ИванПетров")

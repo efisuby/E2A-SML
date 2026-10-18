@@ -144,6 +144,12 @@ and pronoun coreference with BERT embeddings
 `data/`). Set `E2A_SML_COREF_MODEL=none` to skip the embedding stage and use the
 lexical fallback (nearest preceding mention with matching gender).
 
+Character detection only accepts a capitalized word as a name when it repeats
+with several mid-sentence occurrences that spaCy tags as `PROPN` or as part of
+a `PER` entity, and it filters the `COMMON_CAPITALIZED` stoplist of Russian
+function words, pronouns and numerals. Sentence-initial words like «Кто»,
+«То» or «Ну» therefore never become characters.
+
 The spaCy pipeline and the embedding encoder are loaded once per process and
 reused, so analysing several books in one GUI session only pays the load cost
 once. With a CUDA build of PyTorch the encoder runs on the GPU automatically

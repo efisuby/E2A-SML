@@ -213,10 +213,13 @@ class RussianBookNLP:
         # character evidence, so they join the mention pool before clustering.
         for span, hint in zip(spans, hints):
             if hint is not None and hint.kind == "name":
+                hint_tokens = _name_tokens(hint.value)
+                if not hint_tokens or not self._plausible_name(hint_tokens):
+                    continue
                 name_mentions.append(
                     _NameMention(
                         surface=hint.value,
-                        tokens=_name_tokens(hint.value),
+                        tokens=hint_tokens,
                         start=span.start,
                         end=span.end,
                         sentence=sent_index.index_at(span.start),
@@ -282,22 +285,53 @@ class RussianBookNLP:
                 seen.add((ent.start_char, ent.start_char + len(surface)))
 
         # Recurring capitalized sequences catch names the small NER misses.
-        counts: Counter = Counter()
-        matches = []
+        # ``ru_core_news_sm`` capitalizes every sentence-initial word, so a
+        # capitalized token is only trusted as a name when it repeats and at
+        # least two occurrences sit mid-sentence (a sentence-initial capital is
+        # usually just the first word of a sentence), and at least one of those
+        # mid-sentence occurrences is tagged PROPN or falls inside a PER
+        # entity. This drops the "кто/то/ну" style noise the POS model lets
+        # through (see ``COMMON_CAPITALIZED`` for the word-level guard).
+        per_spans: List[tuple] = []
+        if doc is not None:
+            per_spans = sorted(
+                (ent.start_char, ent.start_char + len(ent.text))
+                for ent in doc.ents
+                if ent.label_ == "PER" and ent.text.strip()
+            )
+        per_cursor = 0
+
+        candidates = []
+        mid_counts: Counter = Counter()
+        mid_proper: set = set()
         for match in NAME_RE.finditer(text):
             surface = match.group(0)
+            start, end = match.start(), match.end()
             tokens = _name_tokens(surface)
             if not tokens or not self._plausible_name(tokens):
                 continue
-            if (match.start(), match.end()) in seen:
-                continue
-            matches.append((surface, tokens, match.start(), match.end()))
-            counts[tokens] += 1
-
-        for surface, tokens, start, end in matches:
-            if counts[tokens] < 2:
+            if (start, end) in seen:
                 continue
             if self._has_verb_pos(doc, start, end):
+                continue
+
+            while per_cursor < len(per_spans) and per_spans[per_cursor][1] <= start:
+                per_cursor += 1
+            in_per = per_cursor < len(per_spans) and per_spans[per_cursor][0] < end
+
+            mid = not self._starts_sentence(text, doc, start)
+            candidates.append((surface, tokens, start, end))
+            if mid:
+                mid_counts[tokens] += 1
+                if in_per or self._is_proper_pos(doc, start, end):
+                    mid_proper.add(tokens)
+
+        eligible = {
+            tokens for tokens, count in mid_counts.items() if count >= 2
+        } & mid_proper
+
+        for surface, tokens, start, end in candidates:
+            if tokens not in eligible:
                 continue
             mentions.append(
                 _NameMention(
@@ -330,6 +364,40 @@ class RussianBookNLP:
         if span is None:
             return False
         return any(token.pos_ in {"VERB", "AUX"} for token in span)
+
+    @staticmethod
+    def _starts_sentence(text: str, doc: Any, start: int) -> bool:
+        """True when the character at *start* begins a sentence.
+
+        Uses spaCy's ``is_sent_start`` when the model is available and falls
+        back to the punctuation preceding *start* otherwise.
+        """
+        if doc is not None:
+            try:
+                span = doc.char_span(start, start + 1, alignment_mode="expand")
+            except Exception:
+                span = None
+            if span is not None and len(span):
+                return bool(span[0].is_sent_start)
+        index = start - 1
+        while index >= 0 and text[index] in " \t\r\n":
+            index -= 1
+        if index < 0:
+            return True
+        return text[index] in ".!?…"
+
+    @staticmethod
+    def _is_proper_pos(doc: Any, start: int, end: int) -> bool:
+        """True when spaCy tags every token in ``text[start:end]`` as PROPN."""
+        if doc is None:
+            return False
+        try:
+            span = doc.char_span(start, end, alignment_mode="expand")
+        except Exception:
+            span = None
+        if span is None or not len(span):
+            return False
+        return all(token.pos_ == "PROPN" for token in span)
 
     @staticmethod
     def _plausible_name(tokens: tuple) -> bool:
