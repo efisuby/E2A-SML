@@ -71,8 +71,9 @@ Examples:
     )
     parser.add_argument(
         "--language",
+        choices=["eng", "rus"],
         default="eng",
-        help="Voice-library language code (default: eng); book analysis supports English only",
+        help="Language code for voice library and text analysis ('eng' or 'rus', default: eng)",
     )
     parser.add_argument(
         "--booknlp-dir",
@@ -86,6 +87,12 @@ Examples:
         "--gui",
         action="store_true",
         help="Launch web GUI instead of CLI mode",
+    )
+    parser.add_argument(
+        "--ui-language",
+        choices=["en", "ru"],
+        default=None,
+        help="Interface language of the web GUI (default: $E2A_SML_LANG or en)",
     )
     parser.add_argument("--version", action="version", version=f"E2A-SML {version}")
     parser.add_argument(
@@ -179,7 +186,7 @@ def _run_headless(args:argparse.Namespace)->None:
         progress(f"Text file: {txt_file}", 5)
 
         booknlp_dir = os.path.join(output_dir, "booknlp")
-        result = run_booknlp(txt_file, booknlp_dir, args.model, progress, data_root=args.library_root)
+        result = run_booknlp(txt_file, booknlp_dir, args.model, args.language, progress, data_root=args.library_root)
         book_id = result["book_id"]
 
     # Step 2: Load BookNLP data
@@ -245,6 +252,17 @@ def _launch_gui(args:argparse.Namespace)->None:
         import gradio as gr
         from web_gui import APP_CSS, create_app
 
+        # Interface language: --ui-language wins, then $E2A_SML_LANG, then 'en'.
+        ui_language = args.ui_language or os.environ.get("E2A_SML_LANG")
+        if ui_language in ("en", "ru"):
+            os.environ["E2A_SML_LANG"] = ui_language
+
+        # Default book-language selector follows the CLI --language flag.
+        if args.language in ("eng", "rus"):
+            os.environ.setdefault("E2A_SML_BOOK_LANG", args.language)
+
+        # Build the app after the locale is settled so every label is
+        # rendered in the requested language from the start.
         app = create_app()
         app.launch(
             server_name=args.host,

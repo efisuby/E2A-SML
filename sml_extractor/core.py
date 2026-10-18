@@ -21,40 +21,54 @@ def configure_booknlp_cache(data_root:str|Path|None=None)->Path:
     return model_dir
 
 
-def check_booknlp_installation()->tuple[bool,str]:
+def check_booknlp_installation(language:str='eng')->tuple[bool,str]:
     """Check if BookNLP and its dependencies are properly installed.
+
+    Args:
+        language: Language code ('eng' or 'rus') to check.
 
     Returns:
         Tuple of (is_ok, message). If not ok, message describes what's missing.
     """
     errors = []
+    lang_name = "Russian" if language == "rus" else "English"
 
-    # Check booknlp package
+    # Check booknlp package for the specified language
     try:
-        import booknlp.english
+        if language == "eng":
+            import booknlp.english as booknlp_lang
+            from booknlp.english import EnglishBookNLP  # noqa: F401
+        else:  # rus
+            import booknlp.russian as booknlp_lang
+            from booknlp.russian import RussianBookNLP  # noqa: F401
     except ImportError:
         errors.append(
-            "BookNLP local module is not found. Ensure the 'booknlp' directory "
-            "is in the same folder as this script."
+            f"BookNLP {lang_name.lower()} module is not found. Ensure the 'booknlp' directory "
+            f"is in the same folder as this script."
         )
         return False, "\n".join(errors)
 
-    # The vendored BookNLP code reads these files during model initialization.
-    # Check them here so a fresh checkout fails with an actionable message.
-    resource_dir = Path(booknlp.english.__file__).parent / "data"
-    required_resources = (
-        "aliases.txt",
-        "entity_cat.tagset",
-        "gutenberg_prop_gender_terms.txt",
-        "supersense.tagset",
-        "wordnet.first.sense",
-    )
-    missing_resources = [name for name in required_resources if not (resource_dir / name).is_file()]
-    if missing_resources:
-        return False, (
-            "BookNLP resource files are missing: " + ", ".join(missing_resources)
-            + f". Expected them in {resource_dir}. Reinstall E2A-SML from a complete checkout."
+    # The vendored English BookNLP code reads these files during model
+    # initialization. The Russian pipeline uses spaCy only, so the resource
+    # check applies to English alone.
+    if language == "eng":
+        resource_dir = Path(booknlp_lang.__file__).parent / "data"
+        required_resources = (
+            "aliases.txt",
+            "entity_cat.tagset",
+            "gutenberg_prop_gender_terms.txt",
+            "supersense.tagset",
+            "wordnet.first.sense",
         )
+        missing_resources = [
+            name for name in required_resources if not (resource_dir / name).is_file()
+        ]
+        if missing_resources:
+            return False, (
+                f"BookNLP {language.upper()} resource files are missing: "
+                + ", ".join(missing_resources)
+                + f". Expected them in {resource_dir}. Reinstall E2A-SML from a complete checkout."
+            )
 
     # Check key dependencies that commonly fail
     dep_checks = [
@@ -81,14 +95,16 @@ def check_booknlp_installation()->tuple[bool,str]:
             '  uv pip install "$(python -m spacy info en_core_web_sm --url)"'
         )
 
-    # Check spacy model
+    # Check spacy model for the specified language
+    spacy_model = "en_core_web_sm" if language == "eng" else "ru_core_news_sm"
     try:
         import spacy
-        spacy.load("en_core_web_sm")
+        spacy.load(spacy_model)
     except OSError:
+        lang_name = "English" if language == "eng" else "Russian"
+        install_cmd = f'  uv pip install "$(python -m spacy info {spacy_model} --url)"'
         errors.append(
-            "spaCy English model not found. Install it with:\n"
-            '  uv pip install "$(python -m spacy info en_core_web_sm --url)"'
+            f"{lang_name} spaCy model ({spacy_model}) not found. Install it with:\n" + install_cmd
         )
 
     if errors:
@@ -96,7 +112,10 @@ def check_booknlp_installation()->tuple[bool,str]:
 
     # Try the actual BookNLP import that tends to fail
     try:
-        from booknlp.booknlp import BookNLP  # noqa: F401
+        if language == "eng":
+            from booknlp.booknlp import BookNLP  # noqa: F401
+        else:  # rus
+            from booknlp.russian import RussianBookNLP  # noqa: F401
     except (ImportError, ModuleNotFoundError, AttributeError, OSError) as e:
         return False, (
             f"BookNLP failed to initialize: {e}\n\n"
@@ -106,7 +125,7 @@ def check_booknlp_installation()->tuple[bool,str]:
             '  uv pip install "$(python -m spacy info en_core_web_sm --url)"'
         )
 
-    return True, "BookNLP is ready."
+    return True, f"BookNLP {language.upper()} is ready."
 
 
 def convert_ebook_to_txt(input_file: str, output_dir: str) -> str:
@@ -145,6 +164,7 @@ def run_booknlp(
     input_file:str,
     output_dir:str,
     model:str='small',
+    language:str='eng',
     progress_callback:Callable[[str,int],None]|None=None,
     data_root:str|Path|None=None,
 )->dict[str,str]:
@@ -154,6 +174,7 @@ def run_booknlp(
         input_file: Path to the input text file.
         output_dir: Directory for BookNLP output files.
         model: BookNLP model size ('small' or 'big').
+        language: Language code for text analysis ('eng' or 'rus').
         progress_callback: Optional callable(message, pct) for progress updates.
         data_root: This tool's data directory for the model cache.
 
@@ -166,11 +187,9 @@ def run_booknlp(
     """
     model_dir = configure_booknlp_cache(data_root)
     # Pre-check installation before attempting import
-    ok, msg = check_booknlp_installation()
+    ok, msg = check_booknlp_installation(language)
     if not ok:
         raise RuntimeError(f"BookNLP installation check failed:\n{msg}")
-
-    from booknlp.booknlp import BookNLP
 
     os.makedirs(output_dir, exist_ok=True)
     book_id = Path(input_file).stem
@@ -184,7 +203,18 @@ def run_booknlp(
         'model_path': str(model_dir),
     }
 
-    booknlp = BookNLP("en", model_params)
+    # Use the Russian pipeline for 'rus'; the vendored English BookNLP shim
+    # keys its language check on "en" while this project uses "eng"/"rus".
+    if language == "rus":
+        from booknlp.russian import RussianBookNLP
+
+        booknlp_cls, booknlp_language = RussianBookNLP, "rus"
+    else:
+        from booknlp.booknlp import BookNLP
+
+        booknlp_cls, booknlp_language = BookNLP, "en"
+
+    booknlp = booknlp_cls(booknlp_language, model_params)
 
     if progress_callback:
         progress_callback(f"Processing book with BookNLP ({model} model)...", 10)
@@ -296,8 +326,12 @@ def _parse_entities_file(filepath: str) -> list:
     return entities
 
 
-def extract_characters(booknlp_data: dict) -> list:
+def extract_characters(booknlp_data: dict, language:str='eng') -> list:
     """Extract character information from BookNLP output.
+
+    Args:
+        booknlp_data: BookNLP output data dictionary.
+        language: Language code for TTS engine settings ('eng' or 'rus').
 
     Returns list of character dicts with:
         normalized_name, inferred_gender, inferred_age_category, voice, language
@@ -310,16 +344,19 @@ def extract_characters(booknlp_data: dict) -> list:
     characters = []
 
     # Always add narrator first
-    characters.append(
-        {
-            "normalized_name": "Narrator",
-            "inferred_gender": "unknown",
-            "inferred_age_category": "unknown",
-            "tts_engine": "XTTSv2",
-            "language": "eng",
-            "voice": None,
-        }
-    )
+    chars_list = [{"name": "Narrator"}]  # type: ignore
+
+    for char in chars_list:
+        characters.append(
+            {
+                "normalized_name": f"Narrator-{char['name']}",
+                "inferred_gender": "unknown",
+                "inferred_age_category": "unknown",
+                "tts_engine": "XTTSv2" if language == "eng" else "XTTSv2-Russian",
+                "language": language,
+                "voice": None,
+            }
+        )
 
     if "book_data" not in booknlp_data:
         return characters
@@ -328,10 +365,9 @@ def extract_characters(booknlp_data: dict) -> list:
     char_data = book_data.get("characters", [])
 
     for char in char_data:
-        gender = _infer_gender(char)
-        age = _infer_age(char)
-        proper_names = char.get("names", {}).get("proper", [])
-        raw_name = proper_names[0] if proper_names else f"Character{char.get('id', 0)}"
+        gender = _infer_gender(char, language)
+        age = _infer_age(char, language)
+        raw_name = _first_proper_name(char) or f"Character{char.get('id', 0)}"
         name = _normalize_name(raw_name)
 
         characters.append(
@@ -339,8 +375,8 @@ def extract_characters(booknlp_data: dict) -> list:
                 "normalized_name": name,
                 "inferred_gender": gender,
                 "inferred_age_category": age,
-                "tts_engine": "XTTSv2",
-                "language": "eng",
+                "tts_engine": "XTTSv2" if language == "eng" else "XTTSv2-Russian",
+                "language": language,
                 "voice": None,
             }
         )
@@ -348,34 +384,130 @@ def extract_characters(booknlp_data: dict) -> list:
     return characters
 
 
-def _infer_gender(char: dict) -> str:
-    """Infer gender from character data."""
+def _first_proper_name(char: dict) -> str:
+    """Return the most frequent proper name of a BookNLP character, if any.
+
+    BookNLP's ``.book`` JSON stores names under ``mentions.proper`` as
+    ``{"c": count, "n": name}`` entries; some outputs use ``names.proper``
+    with plain strings instead.
+    """
+    for key in ("mentions", "names"):
+        data = char.get(key)
+        if isinstance(data, dict):
+            proper = data.get("proper") or []
+            if proper:
+                first = proper[0]
+                if isinstance(first, dict):
+                    return str(first.get("n", ""))
+                return str(first)
+    return str(char.get("name", ""))
+
+
+# Russian suffix and name tables shared by gender inference.
+_RU_FEMALE_SUFFIXES = ("а", "я", "ия", "ая", "ья", "на", "ина")
+_RU_MALE_SUFFIXES = ("ов", "ев", "ёв", "ин", "ын", "ий", "ый", "ой", "ь", "й")
+_RU_MALE_NAMES = {
+    "иван", "пётр", "петр", "александр", "дмитрий", "сергей", "николай",
+    "андрей", "павел", "игорь", "владимир", "алексей", "роман", "алексей",
+    "максим", "артём", "артем", "юрий", "борис", "виктор", "виталий",
+    "георгий", "григорий", "денис", "евгений", "емельян", "захар", "илья",
+    "кирилл", "леонид", "михаил", "олег", "ростислав", "станислав", "степан",
+    "тимур", "фёдор", "федор", "филипп", "харитон", "ярослав",
+}
+_RU_FEMALE_NAMES = {
+    "анна", "мария", "елена", "наталья", "ольга", "татьяна", "ксения",
+    "дарья", "марина", "светлана", "вера", "екатерина", "анастасия",
+    "алина", "полина", "юлия", "ирина", "лариса", "милана", "софия",
+    "алиса", "варвара", "валерия", "кристина", "надежда", "людмила",
+    "галя", "лидия", "зоя", "тамара", "раиса", "нина", "яна", "рина",
+}
+
+
+def _infer_gender_from_russian_name(name: str) -> str | None:
+    """Guess a Russian character's gender from their name, or None."""
+    name = name.lower().strip()
+    if not name:
+        return None
+
+    if name in _RU_FEMALE_NAMES:
+        return "female"
+    if name in _RU_MALE_NAMES:
+        return "male"
+
+    # Female endings are checked first: "Пушкина" also matches the male "ин".
+    for suffix in _RU_FEMALE_SUFFIXES:
+        if name.endswith(suffix):
+            return "female"
+    for suffix in _RU_MALE_SUFFIXES:
+        if name.endswith(suffix):
+            return "male"
+    return None
+
+
+def _infer_gender(char: dict, language: str = 'eng') -> str:
+    """Infer gender from character data.
+
+    Args:
+        char: Character dictionary from BookNLP.
+        language: Language code for language-specific inference logic.
+
+    Returns:
+        Gender as 'male', 'female', or 'unknown'.
+    """
     gender_data = char.get("g", None)
-    if gender_data is None:
-        return "unknown"
 
     if isinstance(gender_data, dict):
-        he_count = gender_data.get("he/him/his", 0)
-        she_count = gender_data.get("she/her", 0)
-        they_count = gender_data.get("they/them/their", 0)
+        # English BookNLP counts pronoun mentions under English keys; a
+        # Russian pipeline may count Russian pronouns instead.
+        he_count = (
+            gender_data.get("he/him/his", 0)
+            + gender_data.get("он", 0)
+            + gender_data.get("он/его/ему/им", 0)
+        )
+        she_count = (
+            gender_data.get("she/her", 0)
+            + gender_data.get("она", 0)
+            + gender_data.get("она/её/ей/ею", 0)
+        )
+        they_count = (
+            gender_data.get("they/them/their", 0)
+            + gender_data.get("они", 0)
+            + gender_data.get("они/их/ими", 0)
+        )
 
         if he_count > she_count and he_count > they_count:
             return "male"
-        elif she_count > he_count and she_count > they_count:
+        if she_count > he_count and she_count > they_count:
             return "female"
-        else:
-            return "unknown"
     elif isinstance(gender_data, str):
         if gender_data in ("he/him/his", "male"):
             return "male"
-        elif gender_data in ("she/her", "female"):
+        if gender_data in ("she/her", "female"):
             return "female"
+
+    # Language-specific fallback: infer gender from the character's name.
+    # Note: this must run before giving up, otherwise Russian characters whose
+    # `g` field is missing always end up as "unknown".
+    name = _first_proper_name(char)
+    if name:
+        if language == "rus":
+            gender = _infer_gender_from_russian_name(name)
+            if gender:
+                return gender
 
     return "unknown"
 
 
-def _infer_age(char: dict) -> str:
-    """Infer age category from character data."""
+def _infer_age(char: dict, language:str='eng') -> str:
+    """Infer age category from character data.
+
+    Args:
+        char: Character dictionary from BookNLP.
+        language: Language code for language-specific inference logic.
+
+    Returns:
+        Age category as 'child', 'teen', 'adult', or 'elder'.
+    """
     # Check if age was already inferred
     if "inferred_age_category" in char:
         return char["inferred_age_category"]
@@ -398,13 +530,34 @@ def _infer_age(char: dict) -> str:
         if word in mod_text:
             return "elder"
 
+    # Russian language fallback (search descriptive modifiers for age terms)
+    if language == "rus":
+        hints = f"{mod_text} {_first_proper_name(char)}".lower()
+        child_terms = {"ребёнок", "ребенок", "мальчик", "девочка", "дитя", "младенец", "малыш"}
+        teen_terms = {"подросток", "подростковый", "отрок"}
+        elder_terms = {"старик", "старуха", "бабушка", "дедушка", "пожилой", "дряхлый"}
+
+        for term in child_terms:
+            if term in hints:
+                return "child"
+        for term in teen_terms:
+            if term in hints:
+                return "teen"
+        for term in elder_terms:
+            if term in hints:
+                return "elder"
+
     return "adult"
 
 
 def _normalize_name(name: str) -> str:
-    """Normalize a character name to CamelCase."""
-    # Remove special characters
-    name = re.sub(r"[^a-zA-Z0-9\s]", "", name)
+    """Normalize a character name to CamelCase.
+
+    Keeps any alphabet's letters (Latin and Cyrillic alike) so Russian names
+    survive normalization instead of collapsing to "Unknown".
+    """
+    # Remove special characters, keep letters/digits/whitespace/hyphens
+    name = re.sub(r"[^\w\s-]", "", name, flags=re.UNICODE).replace("_", "")
     # Convert to CamelCase
     parts = name.strip().split()
     return "".join(word.capitalize() for word in parts) if parts else "Unknown"

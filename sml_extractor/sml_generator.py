@@ -58,6 +58,7 @@ def generate_sml_output(
     output_path: str,
     voice_assignments: dict | None = None,
     use_macros: bool = True,
+    emotion_map: dict | None = None,
 ) -> str:
     """Generate SML-formatted text from BookNLP token-level and quote data.
 
@@ -77,28 +78,22 @@ def generate_sml_output(
         use_macros: If True, voice tags use character names as macro references
             instead of raw file paths. This format also needs the generated
             character-to-voice JSON; use path-based tags for direct E2A input.
+        emotion_map: Optional ``{text: label}`` map (see
+            :mod:`sml_extractor.emotion`) that wraps a line in
+            ``[emotion:label]``; lines without a label stay untagged.
 
     Returns:
         Path to the generated SML file.
     """
     char_voice_map = _build_voice_map(characters, voice_assignments)
+    segments = _book_segments(booknlp_data)
 
-    tokens = booknlp_data.get("tokens")
-    quotes = booknlp_data.get("quotes")
-    book_data = booknlp_data.get("book_data")
-
-    if tokens and quotes is not None:
-        sml_content = _generate_from_tokens(
-            tokens, quotes, book_data, char_voice_map, use_macros=use_macros
-        )
-    elif "book_txt" in booknlp_data:
-        sml_content = _generate_from_book_txt(
-            booknlp_data["book_txt"], char_voice_map, use_macros=use_macros
-        )
-    else:
-        raise ValueError(
-            "No token/quote data or book.txt found in BookNLP output."
-        )
+    sml_content = _render_segments(
+        segments,
+        char_voice_map,
+        use_macros=use_macros,
+        emotion_map=emotion_map or {},
+    )
 
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
@@ -107,17 +102,87 @@ def generate_sml_output(
     return output_path
 
 
-def _generate_from_tokens(
+def collect_speech_segments(booknlp_data: dict) -> list:
+    """Return the ordered ``(speaker, text)`` segments the SML writer emits.
+
+    The text is exactly what ends up inside the voice block, so an emotion map
+    built from this list is found again by :func:`generate_sml_output`.
+    """
+    collected = []
+    for speaker, text in _book_segments(booknlp_data):
+        if speaker is None:
+            continue
+        cleaned = clean_tts_text(text)
+        if cleaned:
+            collected.append((speaker, cleaned))
+    return collected
+
+
+def _book_segments(booknlp_data: dict) -> list:
+    """Raw ``(speaker|None, text)`` segments for the available book data."""
+    tokens = booknlp_data.get("tokens")
+    quotes = booknlp_data.get("quotes")
+    if tokens and quotes is not None:
+        return _segments_from_tokens(
+            tokens, quotes, booknlp_data.get("book_data")
+        )
+    if "book_txt" in booknlp_data:
+        return _segments_from_book_txt(booknlp_data["book_txt"])
+    raise ValueError(
+        "No token/quote data or book.txt found in BookNLP output."
+    )
+
+
+def _render_segments(
+    segments: list,
+    char_voice_map: dict,
+    use_macros: bool = True,
+    emotion_map: dict | None = None,
+) -> str:
+    """Turn ``(speaker, text)`` segments into the SML document.
+
+    Every voice block stays on one text line: Calibre can split a TXT book at
+    headings, and an opening tag stranded in another XHTML document would be
+    rejected by E2A, which validates each document separately.
+    """
+    emotion_map = emotion_map or {}
+    sml_lines = []
+
+    for speaker, text in segments:
+        if speaker is None:
+            # Paragraph break ("" from the token path) or a raw pass-through
+            # line from the .book.txt fallback.
+            sml_lines.append(text)
+            continue
+
+        cleaned = clean_tts_text(text)
+        if not cleaned:
+            continue
+
+        label = emotion_map.get(cleaned)
+        body = f"[emotion:{label}]{cleaned}[/emotion]" if label else cleaned
+
+        voice_path = char_voice_map.get(speaker)
+        voice_tag_val = speaker if use_macros else voice_path
+        sml_lines.append(
+            f"[voice:{voice_tag_val}]{body}[/voice]" if voice_tag_val else body
+        )
+
+    return "\n".join(sml_lines)
+
+
+def _segments_from_tokens(
     tokens: list,
     quotes: list,
     book_data: dict | None,
-    char_voice_map: dict,
-    use_macros: bool = True,
-) -> str:
-    """Build SML using token-level quote boundaries.
+) -> list:
+    """Split the token stream at quote boundaries and paragraph breaks.
 
     This gives exact narrator/character voice switches at quote boundaries
     instead of the sentence-level approximation from .book.txt.
+
+    Returns ``(speaker, text)`` pairs; a ``speaker`` of ``None`` marks a
+    paragraph break (with an empty text).
     """
     # Build coref_id -> normalized character name mapping
     coref_to_name = _build_coref_name_map(book_data)
@@ -181,53 +246,29 @@ def _generate_from_tokens(
     if current_words:
         segments.append((current_speaker, _join_tokens(current_words)))
 
-    # Keep every voice block on one text line. Calibre can split a TXT book at
-    # headings; an opening tag on a previous line would be stranded in another
-    # XHTML document before E2A validates each document separately.
-    sml_lines = []
-
-    for speaker, text in segments:
-        if speaker is None:
-            # Paragraph break
-            sml_lines.append("")
-            continue
-
-        text = clean_tts_text(text)
-        if not text:
-            continue
-
-        voice_path = char_voice_map.get(speaker)
-        voice_tag_val = speaker if use_macros else voice_path
-        sml_lines.append(f"[voice:{voice_tag_val}]{text}[/voice]" if voice_tag_val else text)
-
-    return "\n".join(sml_lines)
+    return segments
 
 
-def _generate_from_book_txt(book_txt_content: str, char_voice_map: dict, use_macros: bool = True) -> str:
-    """Fallback: generate SML from sentence-level .book.txt."""
-    lines = book_txt_content.strip().split("\n")
-    sml_lines = []
+def _segments_from_book_txt(book_txt_content: str) -> list:
+    """Split the sentence-level .book.txt into ``(speaker, text)`` segments.
 
-    for line in lines:
-        line = line.strip()
+    ``[Name] text [/]`` lines become dialogue; blank lines stay as paragraph
+    breaks (``None, ""``) and any other line is passed through verbatim.
+    """
+    segments = []
+    for raw_line in book_txt_content.strip().split("\n"):
+        line = raw_line.strip()
         if not line:
-            sml_lines.append("")
+            segments.append((None, ""))
             continue
 
         match = re.match(r"^\[([^\]]+)\]\s*(.*?)\s*\[/\]$", line)
         if match:
-            char_name = match.group(1)
-            text = clean_tts_text(match.group(2).strip())
-            if not text:
-                continue
-
-            voice_path = char_voice_map.get(char_name)
-            voice_tag_val = char_name if use_macros else voice_path
-            sml_lines.append(f"[voice:{voice_tag_val}]{text}[/voice]" if voice_tag_val else text)
+            segments.append((match.group(1), match.group(2).strip()))
         else:
-            sml_lines.append(line)
+            segments.append((None, line))
 
-    return "\n".join(sml_lines)
+    return segments
 
 
 def _build_coref_name_map(book_data: dict | None) -> dict:
@@ -273,8 +314,11 @@ def _build_coref_name_map(book_data: dict | None) -> dict:
 
 
 def _normalize_name(name: str) -> str:
-    """Normalize a name to CamelCase (matching core.py's normalization)."""
-    name = re.sub(r"[^a-zA-Z0-9\s]", "", name)
+    """Normalize a name to CamelCase (matching core.py's normalization).
+
+    Keeps letters of any alphabet so Cyrillic names are not wiped out.
+    """
+    name = re.sub(r"[^\w\s-]", "", name, flags=re.UNICODE).replace("_", "")
     parts = name.strip().split()
     return "".join(word.capitalize() for word in parts) if parts else "Unknown"
 

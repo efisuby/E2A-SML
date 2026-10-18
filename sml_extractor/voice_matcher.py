@@ -13,6 +13,56 @@ VOICE_EXTENSIONS = {".wav", ".mp3", ".flac", ".ogg"}
 AGE_CATEGORIES = {"child", "teen", "adult", "elder"}
 GENDERS = {"male", "female"}
 
+# Voices that are cartoon characters, comedic/meme personas, adverts or
+# synthetic assistants.  They are fun to try out but sound wrong as a book
+# narrator or an ordinary character, so they are never offered for automatic
+# selection.  Matching is case-insensitive and ignores the file extension.
+# Extend (or clear) the set per install with the comma-separated environment
+# variable ``E2A_SML_EXCLUDED_VOICES``.
+EXCLUDED_VOICE_NAMES = frozenset({
+    # Cartoon / fictional characters
+    "cheburashka",
+    "cheburashkamovie_2023",
+    "spoungebob",
+    "sssr_matroskin",
+    "sssr_vinipuh",
+    "optimusprime",
+    "johnnysilverhand",
+    "deadpool",
+    "ingridolerinskaya_judy",
+    # Comedic / meme personas
+    "druzhko_sergey",
+    "goblin_puchkov",
+    "gorshok",
+    "sergey_chihachev_terminator",
+    "zadornov(koncert)",
+    "zhirinovsky",
+    # Adverts / synthetic assistants
+    "aliexpress",
+    "tinkoff",
+    "yandexalisa",
+})
+
+
+def is_voice_excluded(voice: str) -> bool:
+    """Return True when a voice name/path is on the exclude list.
+
+    The check accepts either a bare voice name or a full path and is
+    case-insensitive.  ``E2A_SML_EXCLUDED_VOICES`` adds extra names.
+    """
+    name = os.path.splitext(os.path.basename(str(voice)))[0].strip().lower()
+    if not name:
+        return False
+    if name in EXCLUDED_VOICE_NAMES:
+        return True
+
+    extra = os.environ.get("E2A_SML_EXCLUDED_VOICES", "")
+    return any(
+        name == part.strip().lower()
+        for part in extra.split(",")
+        if part.strip()
+    )
+
 
 def scan_voice_library(library_root: str, language: str = "eng") -> dict:
     """Scan this tool's voice library and return available voices.
@@ -50,8 +100,11 @@ def scan_voice_library(library_root: str, language: str = "eng") -> dict:
 
             voices = []
             for f in sorted(os.listdir(gender_dir)):
-                if Path(f).suffix.lower() in VOICE_EXTENSIONS:
-                    voices.append(os.path.join("voices", language, age_cat, gender, f))
+                if Path(f).suffix.lower() not in VOICE_EXTENSIONS:
+                    continue
+                if is_voice_excluded(f):
+                    continue
+                voices.append(os.path.join("voices", language, age_cat, gender, f))
             library[age_cat][gender] = voices
 
     return library
@@ -82,13 +135,16 @@ def auto_assign_voices(
     characters: list,
     voice_library: dict,
     custom_voices: list | None = None,
+    allow_reuse: bool = True,
 ) -> dict:
     """Automatically assign voices to characters based on gender and age.
 
     Characters with known genders (male/female) are assigned first so they
     get matching voices.  Characters with unknown gender are assigned
     afterward, alternating between male and female pools to avoid exhausting
-    one gender's voice supply.
+    one gender's voice supply.  When the pool is smaller than the cast and
+    *allow_reuse* is set, the leftover characters share voices instead of
+    being left silent.
 
     Args:
         characters: List of character dicts with inferred_gender and inferred_age_category.
@@ -109,10 +165,17 @@ def auto_assign_voices(
             assignments['Narrator'] = voice
             used_voices.add(voice)
 
+    # Key characters come first: a novel can list hundreds of one-line
+    # speakers, and the voice pool runs out. ``sorted`` is stable, so the
+    # original order survives inside each group.
+    ordered = sorted(
+        characters, key=lambda char: 0 if char.get("key_character") else 1
+    )
+
     # Split into known-gender vs unknown-gender characters, preserving order
     known_gender_chars = []
     unknown_gender_chars = []
-    for char in characters:
+    for char in ordered:
         if char.get('normalized_name') == 'Narrator':
             continue
         gender = char.get("inferred_gender", "unknown")
@@ -147,6 +210,22 @@ def auto_assign_voices(
         if voice:
             assignments[name] = voice
             used_voices.add(voice)
+
+    if allow_reuse:
+        # The pool ran out, but a shared voice beats silence.
+        for char in known_gender_chars + unknown_gender_chars:
+            name = char.get("normalized_name", "")
+            if not name or name in assignments:
+                continue
+            voice = _find_best_voice(
+                char.get("inferred_gender", "unknown"),
+                char.get("inferred_age_category", "adult"),
+                voice_library,
+                set(),
+                custom_voices,
+            )
+            if voice:
+                assignments[name] = voice
 
     return assignments
 
@@ -213,7 +292,8 @@ def _pick_unused_voice(
         return None
 
     available = [
-        v for v in voice_library[age][gender] if v not in used_voices
+        v for v in voice_library[age][gender]
+        if v not in used_voices and not is_voice_excluded(v)
     ]
     if not available:
         return None
